@@ -1,0 +1,28 @@
+[package]
+name = "xsession"
+version = "3.4.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Read-only, on-demand search of local AI coding-agent transcripts (Rust port of xsession 2.7.0)"
+
+[[bin]]
+name = "xsession"
+path = "src/main.rs"
+
+[dependencies]
+# Named and minimal. All build offline from the local cargo cache.
+# Fast path for transcript records (JSON); the ordered, Python-compatible parser is ours.
+# float_roundtrip: correctly rounded floats, so truthiness checks agree with Python.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+miniz_oxide = "0.8"   # DEFLATE for .docx/.xlsx project files (zip container and XML are ours)
+# zstd frames for Codex's compressed rollouts (.jsonl.zst): libzstd 1.5.7, the decoder Python's
+# compression.zstd also uses. The frame walk that sizes a file without decoding it is ours.
+zstd = { version = "0.13", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
