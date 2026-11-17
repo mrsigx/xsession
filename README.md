@@ -156,6 +156,10 @@ The Rust unit tests check the port against Python-generated oracle vectors in `c
 - **`current`** knows Claude Code and Codex session IDs (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`), but not Antigravity's.
 - **Sub-agent detection.** A sub-agent whose creating conversation is missing from the inventory can't be recognised as a sub-agent.
 
+## Also from Null Limit
+
+- [skills](https://github.com/mrsigx/skills): free-to-use agent skills, including number-play and aim-profile.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
