@@ -24,7 +24,7 @@ try:
 except ImportError:  # older runtimes report .jsonl.zst transcripts as partial coverage
     _zstd = None
 
-VERSION = '2.8.0'
+VERSION = '2.8.1'
 SNAPSHOT_SLOTS = 16
 SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
 PARALLEL_MIN_BYTES = 256 * 1024 * 1024
@@ -41,6 +41,8 @@ ZSTD_UNAVAILABLE = 'zstd decoding needs Python 3.14 or later (compression.zstd);
 ANTIGRAVITY_EXCLUDED = ('Antigravity: only <conversation>/.system_generated/logs/transcript.jsonl is searched; '
                         'transcript_full.jsonl (the same records untruncated, at the same lines), logs/chunks/ '
                         '(byte-split copies) and step thinking are not')
+HARNESS_OPENERS = ('<task-notification>', '<local-command-caveat>', '<local-command-stdout>', '<cross-session-message>',
+                   '<ci-monitor-event>', '<scheduled-task>', '<fork-boilerplate>', '<artifact-view-context>')
 CLAUDE_EXCLUDED = ('Claude: of attachment records only queued_command (a message that arrived mid-turn) '
                    'is searched; queue-operation records (queue bookkeeping that repeats a message), '
                    'other attachment types, system and api-request records and thinking blocks are not')
@@ -968,6 +970,10 @@ def classify(row, role, text):
     if any(token in lower for token in ('<memory>', '<environment_context>', '<user_instructions>',
             '<system-reminder>', 'memory_summary begins', '# agents.md instructions',
             'current-frontier (memory status head)', '## skills\n')):
+        return 'injected_context', 'wrapper_heuristic'
+    if role == 'user' and lower.startswith(HARNESS_OPENERS):
+        # Claude Code wrote this user-role text itself: a task notification, a local command's output,
+        # a message from another session. The operator's own pastes and slash commands are not listed.
         return 'injected_context', 'wrapper_heuristic'
     if role == 'user' and (lower.startswith('>') or lower.startswith('```') or lower.startswith('<external_')):
         return 'quoted_or_pasted', 'format_heuristic'

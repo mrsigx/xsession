@@ -1,11 +1,11 @@
 [package]
 name = "xsession"
-version = "3.5.0"
+version = "3.5.1"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-description = "Read-only, on-demand search of local AI coding-agent transcripts (Rust port of xsession 2.8.0)"
+description = "Read-only, on-demand search of local AI coding-agent transcripts (Rust port of xsession 2.8.1)"
 
 [[bin]]
 name = "xsession"

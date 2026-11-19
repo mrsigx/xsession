@@ -110,6 +110,14 @@ pub fn classify(row: &Obj, role: &OV, text: &str) -> (&'static str, &'static str
     if TOKENS.iter().any(|t| lower.contains(t)) {
         return ("injected_context", "wrapper_heuristic");
     }
+    // Claude Code wrote this user-role text itself: a task notification, a local command's output, a
+    // message from another session. The operator's own pastes and slash commands are not listed.
+    const HARNESS_OPENERS: [&str; 8] = ["<task-notification>", "<local-command-caveat>", "<local-command-stdout>",
+                                        "<cross-session-message>", "<ci-monitor-event>", "<scheduled-task>",
+                                        "<fork-boilerplate>", "<artifact-view-context>"];
+    if role_str == Some("user") && HARNESS_OPENERS.iter().any(|t| lower.starts_with(t)) {
+        return ("injected_context", "wrapper_heuristic");
+    }
     if role_str == Some("user") && (lower.starts_with('>') || lower.starts_with("```") || lower.starts_with("<external_")) {
         return ("quoted_or_pasted", "format_heuristic");
     }

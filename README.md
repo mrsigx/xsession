@@ -4,8 +4,8 @@ Search the local transcripts of your AI coding agents — Claude Code, OpenAI Co
 
 There are two implementations with the same commands, JSON output and exit codes:
 
-- **Rust** (`src/`, version 3.5.0): fast and multithreaded.
-- **Python** (`python/xsession.py`, version 2.8.0): standard library only, for when you can't build the binary.
+- **Rust** (`src/`, version 3.5.1): fast and multithreaded.
+- **Python** (`python/xsession.py`, version 2.8.1): standard library only, for when you can't build the binary.
 
 The JSON field `version` tells you which one answered.
 
@@ -95,7 +95,7 @@ Provenance classes keep different kinds of text apart:
 | Class | Meaning |
 |---|---|
 | `user_message` | The stored record has the user role. Its `role_only` confidence is not proof that a person typed every word. |
-| `quoted_or_pasted`, `injected_context` | Text that looks pasted, text the app wrapped around the user's input, or a mid-turn message that no person sent |
+| `quoted_or_pasted`, `injected_context` | Text that looks pasted, text the app wrapped around the user's input, text Claude Code wrote into a user record itself (a task notification, a local command's output, a message from another session), or a mid-turn message that no person sent |
 | `tool_input`, `tool_output` | Tool arguments (decoded, with their field path in `block`) and tool results |
 | `delegated_prompt` | A prompt one agent wrote to a sub-agent |
 | `compaction_summary`, `resumed_history` | Summaries, and history copied into a resumed session |

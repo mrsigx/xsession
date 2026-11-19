@@ -10,7 +10,7 @@ use crate::session;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Seek};
 
-pub const VERSION: &str = "3.5.0";
+pub const VERSION: &str = "3.5.1";
 
 pub const ANTIGRAVITY_EXCLUDED: &str = "Antigravity: only <conversation>/.system_generated/logs/transcript.jsonl is searched; \
      transcript_full.jsonl (the same records untruncated, at the same lines), logs/chunks/ (byte-split copies) and step thinking are not";

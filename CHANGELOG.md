@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.1 (Rust) / 2.8.1 (Python), 2026-11-19
+
+- **Machine-written text is no longer labelled as the user's.** Claude Code writes some text into user-role records itself. That text now gives `injected_context`, not `user_message`, and ranks below what the user typed. It opens with one of eight tags:
+  - `<task-notification>`, `<local-command-caveat>` and `<local-command-stdout>`;
+  - `<cross-session-message>`, `<ci-monitor-event>` and `<scheduled-task>`;
+  - `<fork-boilerplate>` and `<artifact-view-context>`.
+- **Unchanged:** the user's own pastes, slash commands and reply quotes keep `user_message`.
+
 ## 3.5.0 (Rust) / 2.8.0 (Python), 2026-11-19
 
 - **Mid-turn messages are found.** A message sent to Claude Code while it was in the middle of a turn is stored as an `attachment` record of type `queued_command`, not as a user record. Earlier versions skipped these records and still reported complete coverage.

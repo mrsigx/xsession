@@ -392,6 +392,22 @@ fn event_fields(record: &str) -> Vec<(String, String, String)> {
 }
 
 #[test]
+fn harness_openers_are_injected_context() {
+    let row = Obj::new().with("kind", OV::str("conversation")).with("agent", OV::str("claude"));
+    let user = OV::str("user");
+    for text in ["<task-notification>t</task-notification>", "  \n<LOCAL-COMMAND-STDOUT>x", "<local-command-caveat>c",
+                 "<cross-session-message>m", "<ci-monitor-event>e", "<scheduled-task>s", "<fork-boilerplate>f",
+                 "<artifact-view-context>a"] {
+        assert_eq!(pytext::classify(&row, &user, text), ("injected_context", "wrapper_heuristic"), "{text}");
+    }
+    for text in ["why does <task-notification> show up as mine?", "<pasted_content id=\"p\">x</pasted_content id=\"p\">",
+                 "<command-name>/model</command-name>", "<!-- reply 1 -->\nanswer", "plain"] {
+        assert_eq!(pytext::classify(&row, &user, text), ("user_message", "role_only"), "{text}");
+    }
+    assert_eq!(pytext::classify(&row, &OV::str("assistant"), "<task-notification>x"), ("assistant", "record_role"));
+}
+
+#[test]
 fn claude_mid_turn_message_is_a_queued_command_attachment() {
     let human = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"sent mid-turn","origin":{"kind":"human"},"humanTurn":true}}"#;
     assert_eq!(event_fields(human), fields_of(&[("user", "sent mid-turn", "0")]));
