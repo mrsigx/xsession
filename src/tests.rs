@@ -365,6 +365,66 @@ fn fields_of(items: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
     items.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string())).collect()
 }
 
+/// (role, text, block) of every field `row_blocks` visits in one Claude or Codex record, read
+/// through both JSON representations, which must agree.
+fn event_fields(record: &str) -> Vec<(String, String, String)> {
+    use crate::fields::{row_blocks, Block, Role};
+    fn collect<J: crate::fields::Json>(event: &J, ordered: bool, show: &dyn Fn(&J) -> String) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        row_blocks(false, event, ordered, &mut |role: Role<'_, J>, text: &str, block: Block<'_>| {
+            let role = match role {
+                Role::Name(n) => n.to_string(),
+                Role::Value(v) => show(v),
+            };
+            let block = match block.to_ov() {
+                OV::Str(s) => s,
+                other => ojson::dumps(&other, false),
+            };
+            out.push((role, text.to_string(), block));
+        })
+        .unwrap();
+        out
+    }
+    let ordered = collect(&ojson::loads(record).unwrap(), true, &|v| ojson::dumps(v, false));
+    let plain = collect(&serde_json::from_str::<serde_json::Value>(record).unwrap(), false, &|v| v.to_string());
+    assert_eq!(ordered, plain, "{record}");
+    ordered
+}
+
+#[test]
+fn claude_mid_turn_message_is_a_queued_command_attachment() {
+    let human = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"sent mid-turn","origin":{"kind":"human"},"humanTurn":true}}"#;
+    assert_eq!(event_fields(human), fields_of(&[("user", "sent mid-turn", "0")]));
+    // Only a sender recorded as human has the user role.
+    for other in [r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":{"kind":"task-notification"}}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":{"kind":"peer"}}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","commandMode":"prompt"}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":"human"}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":null}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":["human"]}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"p","origin":{"kind":["human"]}}}"#] {
+        assert_eq!(event_fields(other), fields_of(&[("system", "p", "0")]), "{other}");
+    }
+    let blocks = r#"{"type":"attachment","attachment":{"type":"queued_command","origin":{"kind":"human"},"prompt":[
+        {"type":"text","text":"before"},{"type":"image","source":{"type":"base64","data":"AAAA"}},"bare",null,5,
+        {"type":"text"},{"type":"text","text":5},{"text":"untyped"},{"type":"text","text":"after"}]}}"#;
+    assert_eq!(event_fields(blocks), fields_of(&[("user", "before", "0"), ("user", "after", "8")]));
+    // Shapes that hold no searchable prompt visit nothing and are not errors.
+    for empty in [r#"{"type":"attachment"}"#,
+                  r#"{"type":"attachment","attachment":null}"#,
+                  r#"{"type":"attachment","attachment":"text"}"#,
+                  r#"{"type":"attachment","attachment":["text"]}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command"}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":null}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":7}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":{"text":"object"}}}"#,
+                  r#"{"type":"attachment","attachment":{"type":["queued_command"],"prompt":"p"}}"#,
+                  r#"{"type":"attachment","attachment":{"type":"file","filename":"f","content":"other kind"}}"#,
+                  r#"{"type":"queue-operation","operation":"enqueue","content":"queued text"}"#] {
+        assert_eq!(event_fields(empty), fields_of(&[]), "{empty}");
+    }
+}
+
 #[test]
 fn antigravity_user_request_spans() {
     use crate::fields::user_request_spans;

@@ -340,6 +340,16 @@ pub fn blocks<'a, J: Json>(e: &'a J, ordered: bool, visit: &mut Visit<'_, 'a, J>
             Some(t) if t.as_str().is_some() => (Role::Name("metadata"), Content::Val(t)),
             _ => return Ok(()),
         },
+        Some("attachment") => {
+            // A message that reached Claude Code mid-turn is a queued_command attachment, not a
+            // user record: its text is in `prompt`. Only a sender recorded as human has the user role.
+            let Some(a) = e.get("attachment").filter(|a| a.is_obj()) else { return Ok(()) };
+            if a.get("type").and_then(Json::as_str) != Some("queued_command") {
+                return Ok(());
+            }
+            let human = a.get("origin").filter(|o| o.is_obj()).and_then(|o| o.get("kind")).and_then(Json::as_str) == Some("human");
+            (Role::Name(if human { "user" } else { "system" }), a.get("prompt").map_or(Content::Nothing, Content::Val))
+        }
         _ => return Ok(()),
     };
     let content = match content {

@@ -4,8 +4,8 @@ Search the local transcripts of your AI coding agents — Claude Code, OpenAI Co
 
 There are two implementations with the same commands, JSON output and exit codes:
 
-- **Rust** (`src/`, version 3.4.0): fast and multithreaded.
-- **Python** (`python/xsession.py`, version 2.7.0): standard library only, for when you can't build the binary.
+- **Rust** (`src/`, version 3.5.0): fast and multithreaded.
+- **Python** (`python/xsession.py`, version 2.8.0): standard library only, for when you can't build the binary.
 
 The JSON field `version` tells you which one answered.
 
@@ -95,7 +95,7 @@ Provenance classes keep different kinds of text apart:
 | Class | Meaning |
 |---|---|
 | `user_message` | The stored record has the user role. Its `role_only` confidence is not proof that a person typed every word. |
-| `quoted_or_pasted`, `injected_context` | Text that looks pasted, or text the app wrapped around the user's input |
+| `quoted_or_pasted`, `injected_context` | Text that looks pasted, text the app wrapped around the user's input, or a mid-turn message that no person sent |
 | `tool_input`, `tool_output` | Tool arguments (decoded, with their field path in `block`) and tool results |
 | `delegated_prompt` | A prompt one agent wrote to a sub-agent |
 | `compaction_summary`, `resumed_history` | Summaries, and history copied into a resumed session |
@@ -104,6 +104,8 @@ Provenance classes keep different kinds of text apart:
 What isn't searched:
 
 - **Only documented text fields are indexed:** message text, tool inputs and tool results. Claude `thinking` blocks, Codex `reasoning` items and Antigravity `thinking` are never indexed or printed. Binary attachments and unknown record types aren't searched either.
+- **Claude Code messages sent mid-turn are searched.** A message that arrives while Claude Code is working is stored as an `attachment` record of type `queued_command`, not as a user record. One whose sender is recorded as human is a `user_message`. Any other sender, such as a task notification, another session or a monitor event, is `injected_context`.
+- **Claude Code records that are not searched:** `queue-operation` records, which are queue bookkeeping that repeats a message; every other attachment type, such as reminders, hook output and file or skill listings; and `system` and `api-request` records. Every response names these under `coverage.excluded`. A queued text that never became a message exists only in the queue records, so it can't be found.
 - **Copies** of a record are labelled as copies. They never count as independent corroboration.
 
 ## Coverage, paging and limits

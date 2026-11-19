@@ -177,7 +177,7 @@ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "xsession"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "miniz_oxide",
  "serde_json",

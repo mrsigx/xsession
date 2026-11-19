@@ -24,7 +24,7 @@ try:
 except ImportError:  # older runtimes report .jsonl.zst transcripts as partial coverage
     _zstd = None
 
-VERSION = '2.7.0'
+VERSION = '2.8.0'
 SNAPSHOT_SLOTS = 16
 SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
 PARALLEL_MIN_BYTES = 256 * 1024 * 1024
@@ -41,6 +41,9 @@ ZSTD_UNAVAILABLE = 'zstd decoding needs Python 3.14 or later (compression.zstd);
 ANTIGRAVITY_EXCLUDED = ('Antigravity: only <conversation>/.system_generated/logs/transcript.jsonl is searched; '
                         'transcript_full.jsonl (the same records untruncated, at the same lines), logs/chunks/ '
                         '(byte-split copies) and step thinking are not')
+CLAUDE_EXCLUDED = ('Claude: of attachment records only queued_command (a message that arrived mid-turn) '
+                   'is searched; queue-operation records (queue bookkeeping that repeats a message), '
+                   'other attachment types, system and api-request records and thinking blocks are not')
 # Antigravity steps whose text the app wrote, and steps whose content is tool output. CHECKPOINT
 # is a compaction summary; any other step type is reported as unknown.
 ANTIGRAVITY_SYSTEM_STEPS = ('SYSTEM_MESSAGE', 'EPHEMERAL_MESSAGE', 'CONVERSATION_HISTORY', 'ERROR_MESSAGE')
@@ -101,8 +104,9 @@ def config_for(args):
 
 def initial_coverage(config):
     excluded = config.get('excluded', [])
-    if isinstance(excluded, list) and any(s.get('kind') == 'antigravity' for s in config.get('sources', [])):
-        excluded = excluded + [ANTIGRAVITY_EXCLUDED]
+    for kind, line in (('claude', CLAUDE_EXCLUDED), ('antigravity', ANTIGRAVITY_EXCLUDED)):
+        if isinstance(excluded, list) and any(s.get('kind') == kind for s in config.get('sources', [])):
+            excluded = excluded + [line]
     return {'scope': 'configured sources only', 'complete': True, 'sources': [],
             'errors': [], 'excluded': excluded, 'files': 0,
             'malformed_records': 0, 'unfinished_records': 0, 'changed_files': 0,
@@ -854,6 +858,15 @@ def blocks_from_event(e):
         role, content = 'summary', message.get('summary', message.get('message', ''))
     elif kind == 'custom-title' and isinstance(e.get('customTitle'), str):
         role, content = 'metadata', e['customTitle']
+    elif kind == 'attachment':
+        # A message that reached Claude Code mid-turn is a queued_command attachment, not a user
+        # record: its text is in `prompt`. Only a sender recorded as human has the user role.
+        attachment = e.get('attachment')
+        if not isinstance(attachment, dict) or attachment.get('type') != 'queued_command':
+            return
+        origin = attachment.get('origin')
+        human = isinstance(origin, dict) and origin.get('kind') == 'human'
+        role, content = ('user' if human else 'system'), attachment.get('prompt')
     else:
         return
     if isinstance(content, str):
@@ -946,7 +959,8 @@ def classify(row, role, text):
         return 'tool_input', 'record_type'
     if role == 'metadata':
         return 'title_metadata', 'record_type'
-    if role == 'system' and row['agent'] == 'antigravity':
+    if role == 'system' and row['agent'] in ('antigravity', 'claude'):
+        # Claude rows get this role only from a mid-turn message whose sender is not human.
         return 'injected_context', 'record_type'
     lower = text.lstrip().casefold()
     if '<codex_delegation>' in lower or row['kind'] in ('subagent', 'reviewer') and role == 'user':

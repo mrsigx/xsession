@@ -10,10 +10,13 @@ use crate::session;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Seek};
 
-pub const VERSION: &str = "3.4.0";
+pub const VERSION: &str = "3.5.0";
 
 pub const ANTIGRAVITY_EXCLUDED: &str = "Antigravity: only <conversation>/.system_generated/logs/transcript.jsonl is searched; \
      transcript_full.jsonl (the same records untruncated, at the same lines), logs/chunks/ (byte-split copies) and step thinking are not";
+pub const CLAUDE_EXCLUDED: &str = "Claude: of attachment records only queued_command (a message that arrived mid-turn) \
+     is searched; queue-operation records (queue bookkeeping that repeats a message), \
+     other attachment types, system and api-request records and thinking blocks are not";
 const SUBAGENTS_CREATED: [&str; 2] = ["Created the following subagents:", "Created the following subagent:"];
 
 pub fn env(name: &str) -> Option<String> {
@@ -108,12 +111,14 @@ pub fn config_for(sources_arg: Option<&str>) -> Result<OV, Fail> {
 
 pub fn initial_coverage(config: &Obj) -> Obj {
     let mut excluded = config.get("excluded").cloned().unwrap_or(OV::Arr(Vec::new()));
-    let antigravity = match config.get("sources") {
-        Some(OV::Arr(sources)) => sources.iter().any(|s| s.as_obj().and_then(|o| o.str_of("kind")) == Some("antigravity")),
+    let has_kind = |kind: &str| match config.get("sources") {
+        Some(OV::Arr(sources)) => sources.iter().any(|s| s.as_obj().and_then(|o| o.str_of("kind")) == Some(kind)),
         _ => false,
     };
-    if let (OV::Arr(items), true) = (&mut excluded, antigravity) {
-        items.push(OV::str(ANTIGRAVITY_EXCLUDED));
+    for (kind, line) in [("claude", CLAUDE_EXCLUDED), ("antigravity", ANTIGRAVITY_EXCLUDED)] {
+        if let (OV::Arr(items), true) = (&mut excluded, has_kind(kind)) {
+            items.push(OV::str(line));
+        }
     }
     Obj::new()
         .with("scope", OV::str("configured sources only"))

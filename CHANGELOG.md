@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.0 (Rust) / 2.8.0 (Python), 2026-11-19
+
+- **Mid-turn messages are found.** A message sent to Claude Code while it was in the middle of a turn is stored as an `attachment` record of type `queued_command`, not as a user record. Earlier versions skipped these records and still reported complete coverage.
+  - A sender recorded as human gives `user_message`. Any other sender gives `injected_context`.
+  - A copy inherited by a resumed or forked session is `resumed_history`, like any other inherited record.
+- **Disclosure.** When a Claude source is configured, `coverage.excluded` names the Claude record types that are not searched: queue bookkeeping, other attachment types, and `system` and `api-request` records.
+- **Cursors** from 3.4 and 2.7 are rejected, as after every version change.
+
 ## 3.4.0 (Rust) / 2.7.0 (Python), 2026-11-03
 
 First public release.

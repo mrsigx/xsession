@@ -96,7 +96,8 @@ pub fn classify(row: &Obj, role: &OV, text: &str) -> (&'static str, &'static str
         Some("tool") => return ("tool_output", "record_type"),
         Some("tool_input") => return ("tool_input", "record_type"),
         Some("metadata") => return ("title_metadata", "record_type"),
-        Some("system") if row.str_of("agent") == Some("antigravity") => return ("injected_context", "record_type"),
+        // Claude rows get this role only from a mid-turn message whose sender is not human.
+        Some("system") if matches!(row.str_of("agent"), Some("antigravity" | "claude")) => return ("injected_context", "record_type"),
         _ => {}
     }
     let lower = casefold(lstrip(text));
