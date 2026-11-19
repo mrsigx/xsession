@@ -368,7 +368,12 @@ pub fn verify_search_snapshot(rows: &[OV]) -> Result<(), Fail> {
         let Some(expected) = row.get("_prefix_sha256").filter(|v| v.truthy()) else { continue };
         let path = row.str_of("path").unwrap_or("").to_string();
         let size = row.int_of("bytes").unwrap_or(0).max(0) as u64;
-        match prefix_check(&pathx::norm(&path), size, true) {
+        let observed = if crate::exports::is_export(row) {
+            crate::exports::span_digest(row)
+        } else {
+            prefix_check(&pathx::norm(&path), size, true)
+        };
+        match observed {
             Ok(d) if expected.as_str() == Some(d.as_str()) => {}
             Ok(_) => return Err(Fail::Stale(format!("captured source prefix changed: {}", path))),
             Err(_) => return Err(Fail::Stale(format!("captured source unavailable: {}", path))),
@@ -377,8 +382,9 @@ pub fn verify_search_snapshot(rows: &[OV]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `reopen_hit(hit, query, titles)` for a saved match.
-pub fn reopen_hit(hit: &Obj, query: &str, titles: &Obj) -> Result<Obj, Fail> {
+/// `reopen_hit(hit, query, titles, captured, cache)` for a saved match; `exports` holds the
+/// captured export rows and the conversations already read for this page.
+pub fn reopen_hit(hit: &Obj, query: &str, titles: &Obj, exports: &mut crate::exports::Reopen) -> Result<Obj, Fail> {
     let path = hit.str_of("path").unwrap_or("").to_string();
     if hit.str_of("provenance") == Some("title_metadata") {
         if let Some(OV::Obj(title)) = hit.str_of("id").and_then(|id| titles.get(id)) {
@@ -403,6 +409,9 @@ pub fn reopen_hit(hit: &Obj, query: &str, titles: &Obj) -> Result<Obj, Fail> {
         }
         let text = units[line as usize - 1].clone();
         return Ok(excerpt(&hit.clone().with("text", OV::Str(text)), query));
+    }
+    if crate::exports::is_export(hit) {
+        return exports.reopen(hit, query);
     }
     let mut f = crate::session::open(&pathx::norm(&path))?;
     let offset = hit.int_of("byte_offset").unwrap_or(0).max(0) as u64;

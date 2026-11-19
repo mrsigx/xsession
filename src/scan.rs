@@ -136,6 +136,9 @@ pub fn records(row: &mut Obj, cov: &mut Obj, needle: Option<&str>, strong: bool,
     if matches!(row.str_of("format"), Some("docx") | Some("xlsx")) {
         return package_records(row, cov, needle, strong, emit);
     }
+    if crate::exports::is_export(row) {
+        return crate::exports::export_records(row, cov, needle, strong, emit);
+    }
     let text_mode = row.str_of("kind") == Some("document") || row.str_of("format") == Some("text");
     let p = pathx::norm(row.str_of("path").unwrap_or(""));
     if let Err(e) = records_inner(row, cov, needle, strong, ids, emit, text_mode, &p) {

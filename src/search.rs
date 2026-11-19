@@ -3,7 +3,7 @@
 //! import-copy collapse).
 
 use crate::inventory::is_complete;
-use crate::ojson::{Obj, OV};
+use crate::ojson::{self, Obj, OV};
 use crate::pyerr::{py_int, Fail};
 use crate::pyobj::{casefold_of, cmp_f64, py_cmp, py_eq, try_sort_by, PyDict};
 use crate::pytext::{casefold, excerpt};
@@ -273,6 +273,17 @@ pub fn search(rows: &mut [Obj], query: &str, cov: &mut Obj, titles: &PyDict<Obj>
     }
     let mut kept: Vec<usize> = Vec::new();
     let mut copies: Vec<(usize, Obj)> = Vec::new();
+    // The same message field of the same conversation in another export (another span): a
+    // snapshot's copy. Import copies are folded first, as in Python.
+    let mut exported: HashMap<String, usize> = HashMap::new();
+    let copy_of = |h: &Obj| {
+        let mut copy = Obj::new();
+        for k in ["id", "path", "line", "record_sha256"] {
+            copy.set(k, h.get(k).cloned().unwrap_or(OV::Null));
+        }
+        copy
+    };
+    let span_of = |h: &Obj| (h.get("path").cloned().unwrap_or(OV::Null), h.get("export_offset").cloned().unwrap_or(OV::Null));
     for (i, h) in hits.iter().enumerate() {
         let original = if truncated(h) {
             None
@@ -284,16 +295,37 @@ pub fn search(rows: &mut [Obj], query: &str, cov: &mut Obj, titles: &PyDict<Obj>
                 None => None,
             }
         };
-        match original {
-            Some(o) if h.str_of("provenance") == Some("import_copy") => {
-                let mut copy = Obj::new();
-                for k in ["id", "path", "line", "record_sha256"] {
-                    copy.set(k, h.get(k).cloned().unwrap_or(OV::Null));
-                }
-                copies.push((o, copy));
-            }
-            _ => kept.push(i),
+        if let Some(o) = original.filter(|_| h.str_of("provenance") == Some("import_copy")) {
+            copies.push((o, copy_of(h)));
+            continue;
         }
+        if crate::exports::is_export(h) && h.str_of("provenance") != Some("title_metadata") {
+            // The message's own id names it within its conversation; without one, its line does.
+            let place = h.get("record_id").filter(|v| !v.is_null()).or_else(|| h.get("line"));
+            let key = [h.get("agent"), h.get("id"), place, h.get("record_sha256"), h.get("block")]
+                .iter()
+                .map(|v| ojson::dumps(v.unwrap_or(&OV::Null), true))
+                .collect::<Vec<_>>()
+                .join("\u{0}");
+            match exported.get(&key) {
+                Some(&o) => {
+                    let (first, this) = (span_of(&hits[o]), span_of(h));
+                    if !(py_eq(&first.0, &this.0) && py_eq(&first.1, &this.1)) {
+                        let mut copy = copy_of(h);
+                        copy.set("export_offset", this.1);
+                        if let Some(branch) = h.get("current_branch") {
+                            copy.set("current_branch", branch.clone());
+                        }
+                        copies.push((o, copy));
+                        continue;
+                    }
+                }
+                None => {
+                    exported.insert(key, i);
+                }
+            }
+        }
+        kept.push(i);
     }
     for (o, copy) in copies {
         match hits[o].get_mut("copies") {

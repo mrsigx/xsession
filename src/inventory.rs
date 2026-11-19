@@ -10,7 +10,7 @@ use crate::session;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Seek};
 
-pub const VERSION: &str = "3.5.1";
+pub const VERSION: &str = "3.6.0";
 
 pub const ANTIGRAVITY_EXCLUDED: &str = "Antigravity: only <conversation>/.system_generated/logs/transcript.jsonl is searched; \
      transcript_full.jsonl (the same records untruncated, at the same lines), logs/chunks/ (byte-split copies) and step thinking are not";
@@ -115,7 +115,9 @@ pub fn initial_coverage(config: &Obj) -> Obj {
         Some(OV::Arr(sources)) => sources.iter().any(|s| s.as_obj().and_then(|o| o.str_of("kind")) == Some(kind)),
         _ => false,
     };
-    for (kind, line) in [("claude", CLAUDE_EXCLUDED), ("antigravity", ANTIGRAVITY_EXCLUDED)] {
+    for (kind, line) in [("claude", CLAUDE_EXCLUDED), ("antigravity", ANTIGRAVITY_EXCLUDED),
+                         ("chatgpt_export", crate::exports::CHATGPT_EXPORT_EXCLUDED),
+                         ("claude_export", crate::exports::CLAUDE_EXPORT_EXCLUDED)] {
         if let (OV::Arr(items), true) = (&mut excluded, has_kind(kind)) {
             items.push(OV::str(line));
         }
@@ -218,10 +220,13 @@ pub fn inventory(config: &Obj, cov: &mut Obj, guard: bool) -> Result<Vec<Obj>, F
             problem(cov, "source_unavailable", &root, "");
             continue;
         }
-        if source.kind == "chatgpt_project" || source.kind == "antigravity" {
+        if source.kind == "chatgpt_project" || source.kind == "antigravity" || crate::exports::is_export_kind(source.kind) {
             let result = match pathx::resolve(&root) {
                 Ok(resolved_root) if source.kind == "chatgpt_project" => {
                     crate::projects::project_rows(&root, &resolved_root, &source, index, cov, &mut seen, guard)
+                }
+                Ok(resolved_root) if source.kind != "antigravity" => {
+                    crate::exports::export_rows(&root, &resolved_root, &source, index, cov, &mut seen, guard)
                 }
                 Ok(resolved_root) => antigravity_rows(&root, &resolved_root, &source, index, cov, &mut seen, guard),
                 Err(e) => Err(Fail::Os(e)),

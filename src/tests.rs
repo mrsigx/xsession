@@ -484,3 +484,38 @@ fn antigravity_thinking_is_never_visited() {
     let silent = r#"{"type":"PLANNER_RESPONSE","source":"MODEL","thinking":"hidden plan"}"#;
     assert!(antigravity_fields(silent).is_empty());
 }
+
+#[test]
+fn export_times_are_cut_from_the_shortest_decimal_form() {
+    use crate::exports::epoch_iso;
+    let at = |text: &str| epoch_iso(Some(&ojson::loads(text).unwrap()));
+    assert_eq!(at("0"), OV::str("1970-01-01T00:00:00.000000Z"));
+    assert_eq!(at("951782400.5"), OV::str("2000-02-29T00:00:00.500000Z"));
+    assert_eq!(at("1700000104.9999995"), OV::str("2023-11-14T22:15:04.999999Z"));
+    assert_eq!(at("99999999999"), OV::str("5138-11-16T09:46:39.000000Z"));
+    for rejected in ["253402300799", "-1", "1e16", "true", "null", "\"1700000000\""] {
+        assert_eq!(at(rejected), OV::Null, "{}", rejected);
+    }
+}
+
+#[test]
+fn export_spans_are_byte_offsets_of_array_elements() {
+    use crate::exports::{export_spans, nested_deeper};
+    let spans_of = |data: &[u8]| {
+        let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+        export_spans(data, &mut |start, length, _, lookalike| spans.push((start, length, lookalike))).map(|_| spans)
+    };
+    let data = "\u{feff}[ {\"a\": \"]}\\\"\"} ,\n [1, {\"b\": \"é\u{10f800}\"}], \"x\" ]\n".as_bytes();
+    let spans = spans_of(data).unwrap();
+    let texts: Vec<&str> = spans.iter().map(|(start, length, _)| std::str::from_utf8(&data[*start..start + length]).unwrap()).collect();
+    assert_eq!(texts, ["{\"a\": \"]}\\\"\"}", "[1, {\"b\": \"é\u{10f800}\"}]", "\"x\""]);
+    assert_eq!(spans.iter().map(|s| s.2).collect::<Vec<_>>(), [false, true, false]);
+    for bad in ["{}", "[1 2]", "[1,]", "[{\"a\":1}} ]", "[] x", "[\"open]"] {
+        assert!(spans_of(bad.as_bytes()).is_err(), "{}", bad);
+    }
+    assert!(spans_of(b"[ ]").unwrap().is_empty());
+    let deep = |n: usize| format!("[{}\"[[\\\"\"{}]", "[".repeat(n - 1), "]".repeat(n - 1));
+    assert!(!nested_deeper(deep(256).as_bytes(), 256));
+    assert!(nested_deeper(deep(257).as_bytes(), 256));
+    assert!(spans_of(deep(257).as_bytes()).is_err());
+}

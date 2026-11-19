@@ -4,8 +4,8 @@ Search the local transcripts of your AI coding agents — Claude Code, OpenAI Co
 
 There are two implementations with the same commands, JSON output and exit codes:
 
-- **Rust** (`src/`, version 3.5.1): fast and multithreaded.
-- **Python** (`python/xsession.py`, version 2.8.1): standard library only, for when you can't build the binary.
+- **Rust** (`src/`, version 3.6.0): fast and multithreaded.
+- **Python** (`python/xsession.py`, version 2.9.0): standard library only, for when you can't build the binary.
 
 The JSON field `version` tells you which one answered.
 
@@ -79,6 +79,30 @@ For a custom set, pass a JSON file with `--sources <file>` (or set `XSESSION_CON
 ```
 
 A `document` source searches `.md`, `.txt`, `.json` and `.jsonl` files line by line, as documents. Their lines are not attributed to any speaker.
+
+### Data exports from ChatGPT and claude.ai
+
+Chats you had in ChatGPT or claude.ai are not files on your computer, but both services let you export them as a ZIP. Extract the ZIP and add its folder as a source. These kinds are never default sources:
+
+```json
+{"name": "chatgpt-export", "kind": "chatgpt_export", "path": "/home/me/exports/chatgpt"},
+{"name": "claude-export", "kind": "claude_export", "path": "/home/me/exports/claude"}
+```
+
+How an export is read:
+
+- **Files.** Every `conversations.json` or `conversations-NNN.json` under the folder is read. A ZIP is reported in `coverage.notes`, not opened.
+- **Sessions.** Each conversation is a session, with the export's own conversation id, title and creation time. `export_offset` and `bytes` give its span in the file, and the span's SHA-256 guards every later read of it. A conversation id seen earlier in the same file is reported as `identity_duplicate`, not listed twice.
+- **Hits.** `line` numbers the message within its conversation, in reading order, and `block` names the field. An export is one JSON document, so `byte_offset` is null, and `record_sha256` hashes the whole message object as Python's `json.dumps` writes it. `read <id> --line N --record-sha256 <digest>` still refuses a changed message.
+- **Branches.** ChatGPT keeps a conversation as a tree, with edits and regenerations as branches. It is read depth-first, and `current_branch` says whether a message is on the branch the app shows.
+- **Roles.** User messages the app hides (custom instructions and context it adds) and system messages are `injected_context`. An assistant message addressed to a tool is `tool_input`, and a tool's reply is `tool_output`. Text claude.ai extracted from an attached file is `quoted_or_pasted`.
+- **Never searched or returned:** ChatGPT thoughts and reasoning recaps, and claude.ai thinking. They are parsed with the rest of the file, and they are part of the message `record_sha256` hashes.
+- **Age.** An export is a snapshot. Each file's newest conversation update is a coverage note, so you can see how old it is.
+- **Unknown shapes.** In `find` and `read`, an unknown content type, part, block type, tool result item, attachment, sender or mapping node, and a second message with a message id already seen in its conversation, are counted as unsupported records, so coverage reads partial instead of looking complete. `list` skips them without counting, as it does for transcripts.
+- **Copies.** The same conversation in two exports is two sessions. In `find`, the same message (by its id, or its line when it has none) and field found again in the other export is listed under `copies` on the first hit, with its `export_offset` and `current_branch`, not as a second hit. Two identical messages without ids in one conversation stay two hits; a message id seen twice in one conversation is the unsupported record above.
+- **Limits.** A file over 1 GiB is reported as `export_too_large`, and a file nesting arrays and objects more than 256 levels deep as `export_unsupported`. A conversation holding a character in U+10F800..U+10FFFF, literal or escaped as a surrogate pair, is an unsupported record in both implementations: the Rust core cannot tell it from the placeholder it uses for a lone surrogate. The check is conservative: any `\udbfe` or `\udbff` escape in the conversation's text counts, even one that is unpaired or follows an escaped backslash.
+
+Tested against real ChatGPT and claude.ai exports. The test suite builds its own synthetic exports.
 
 ## What a hit tells you
 

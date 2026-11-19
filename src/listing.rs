@@ -128,6 +128,9 @@ fn read_window<R: Read + Seek>(f: &mut R, start: u64, length: u64) -> std::io::R
 
 /// `list_row(row, coverage)`.
 pub fn list_row(row: &mut Obj, cov: &mut Obj) -> Obj {
+    if crate::exports::is_export(row) {
+        return crate::exports::export_list_row(row, cov);
+    }
     const WINDOW: u64 = 65536;
     let size = row.int_of("bytes").unwrap_or(0).max(0) as u64;
     let mut ranges = vec![(0u64, size.min(WINDOW))];

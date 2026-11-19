@@ -3,6 +3,7 @@
 
 mod args;
 mod cli;
+mod exports;
 mod fields;
 mod hash;
 mod inventory;

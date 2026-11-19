@@ -344,7 +344,8 @@ fn body(a: &Args, out: &mut Out, started: Instant, result: &mut Obj) -> Result<i
         query = current_ids.iter().flatten().find(|v| !v.is_empty()).cloned();
     }
     let mut config = config_for(a.sources.as_deref())?;
-    let source_error = || Fail::Invalid("each source needs string name/path and kind claude, codex, antigravity, document, or chatgpt_project".into());
+    let source_error = || Fail::Invalid("each source needs string name/path and kind claude, codex, antigravity, document, \
+                                         chatgpt_project, chatgpt_export, or claude_export".into());
     {
         let Some(cfg) = config.as_obj() else {
             return Err(Fail::Invalid("source configuration must be an object with a sources array".into()));
@@ -354,7 +355,8 @@ fn body(a: &Args, out: &mut Out, started: Instant, result: &mut Obj) -> Result<i
         };
         for s in sources {
             let Some(s) = s.as_obj() else { return Err(source_error()) };
-            let kind_ok = matches!(s.str_of("kind"), Some("claude" | "codex" | "antigravity" | "document" | "chatgpt_project"));
+            let kind_ok = matches!(s.str_of("kind"), Some("claude" | "codex" | "antigravity" | "document" | "chatgpt_project"
+                                                           | "chatgpt_export" | "claude_export"));
             if !kind_ok || s.str_of("name").is_none() || s.str_of("path").is_none() {
                 return Err(source_error());
             }
@@ -524,8 +526,9 @@ fn body(a: &Args, out: &mut Out, started: Instant, result: &mut Obj) -> Result<i
             let titles_obj = titles_json.as_ref().and_then(OV::as_obj).cloned().unwrap_or_default();
             let page: Vec<OV> = result.get("results").and_then(OV::as_arr).cloned().unwrap_or_default();
             let mut reopened = Vec::with_capacity(page.len());
+            let mut exports = crate::exports::Reopen::new(&rows, &page);
             for hit in page {
-                reopened.push(OV::Obj(snapshot::reopen_hit(&hit.as_obj().cloned().unwrap_or_default(), &q, &titles_obj)?));
+                reopened.push(OV::Obj(snapshot::reopen_hit(&hit.as_obj().cloned().unwrap_or_default(), &q, &titles_obj, &mut exports)?));
             }
             result.set("results", OV::Arr(reopened));
         }
@@ -539,7 +542,14 @@ fn body(a: &Args, out: &mut Out, started: Instant, result: &mut Obj) -> Result<i
                 }
                 let mut context_cov = initial_coverage(&cfg_obj);
                 let line = hit.int_of("line").unwrap_or(0);
-                let records = context_for(hit, line, context as usize, &mut context_cov, &ids)?;
+                let records = if crate::exports::is_export(hit) {
+                    // The context is read against the span guard the inventory captured.
+                    let mut target = hit.clone();
+                    target.set("_guards", crate::exports::captured_guards(&rows, hit));
+                    context_for(&mut target, line, context as usize, &mut context_cov, &ids)?
+                } else {
+                    context_for(hit, line, context as usize, &mut context_cov, &ids)?
+                };
                 let expected = hit.get("record_sha256").cloned().unwrap_or(OV::Null);
                 let ok = records.iter().find(|r| r.int_of("line") == Some(line)).is_some_and(|r| crate::pyobj::py_eq(r.get("record_sha256").unwrap_or(&OV::Null), &expected));
                 hit.set("context", OV::Arr(records.into_iter().map(OV::Obj).collect()));

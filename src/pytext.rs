@@ -96,8 +96,13 @@ pub fn classify(row: &Obj, role: &OV, text: &str) -> (&'static str, &'static str
         Some("tool") => return ("tool_output", "record_type"),
         Some("tool_input") => return ("tool_input", "record_type"),
         Some("metadata") => return ("title_metadata", "record_type"),
-        // Claude rows get this role only from a mid-turn message whose sender is not human.
-        Some("system") if matches!(row.str_of("agent"), Some("antigravity" | "claude")) => return ("injected_context", "record_type"),
+        // Claude rows get this role only from a mid-turn message whose sender is not human; export
+        // rows from system messages and from user messages the app hides.
+        Some("system") if matches!(row.str_of("agent"), Some("antigravity" | "claude" | "chatgpt_export" | "claude_export")) => {
+            return ("injected_context", "record_type")
+        }
+        // Text claude.ai extracted from a file attached to a message.
+        Some("attachment") => return ("quoted_or_pasted", "record_type"),
         _ => {}
     }
     let lower = casefold(lstrip(text));

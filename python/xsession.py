@@ -5,7 +5,7 @@ import base64
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import io
 import json
@@ -24,7 +24,7 @@ try:
 except ImportError:  # older runtimes report .jsonl.zst transcripts as partial coverage
     _zstd = None
 
-VERSION = '2.8.1'
+VERSION = '2.9.0'
 SNAPSHOT_SLOTS = 16
 SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
 PARALLEL_MIN_BYTES = 256 * 1024 * 1024
@@ -53,6 +53,43 @@ ANTIGRAVITY_TOOL_STEPS = ('GENERIC', 'RUN_COMMAND', 'VIEW_FILE', 'CODE_ACTION', 
                           'SEARCH_WEB', 'READ_URL_CONTENT', 'GENERATE_IMAGE', 'INVOKE_SUBAGENT', 'ASK_QUESTION')
 SUBAGENTS_CREATED = ('Created the following subagents:', 'Created the following subagent:')
 CONVERSATION_ID = re.compile(r'"conversationId":[ \t\r\n]*"([^"]*)"')
+# Official data exports, extracted from their ZIP: each conversations.json (or numbered
+# conversations-NNN.json) holds a JSON array of conversations.
+EXPORT_KINDS = ('chatgpt_export', 'claude_export')
+EXPORT_FILE = re.compile(r'conversations(-[0-9]+)?\.json')
+EXPORT_EXCLUDED = {
+    'chatgpt_export': ('ChatGPT export: only conversations.json and conversations-NNN.json are searched; '
+                       'thoughts and reasoning_recap content, images, audio, other files and the export\'s '
+                       'other documents (chat.html, user, settings, feedback, manifest) are not'),
+    'claude_export': ('Claude export: only conversations.json and conversations-NNN.json are searched; '
+                      'thinking, token_budget and flag blocks, files without extracted text, and users.json, '
+                      'projects.json and memories.json are not')}
+JSON_SPACE = re.compile(r'[ \t\n\r]*')
+EPOCH_NUMBER = re.compile(r'([0-9]{1,11})(?:\.([0-9]+))?')
+# ChatGPT content types whose named string fields are searched, and those with nothing to search:
+# reasoning is never indexed, and computer_output is a screenshot.
+CHATGPT_FIELDS = {'code': ('text',), 'execution_output': ('text',), 'tether_browsing_display': ('result', 'summary'),
+                  'tether_quote': ('title', 'text'), 'sonic_webpage': ('title', 'snippet', 'text'),
+                  'system_error': ('name', 'text'), 'user_editable_context': ('user_profile', 'user_instructions')}
+CHATGPT_SILENT = ('thoughts', 'reasoning_recap', 'computer_output')
+# multimodal_text parts that hold media, not text.
+CHATGPT_MEDIA = ('image_asset_pointer', 'audio_asset_pointer', 'real_time_user_audio_video_asset_pointer')
+CLAUDE_EXPORT_SILENT = ('thinking', 'token_budget', 'flag')
+# tool_result content items that may carry no text: web pages, local files, retrieved documents.
+CLAUDE_RESULT_ITEMS = ('text', 'knowledge', 'local_resource', 'rag_reference')
+# Bounds on what one export file may hold. Deeper nesting would reach recursion limits that differ
+# between the cores; the Rust core cannot tell a literal U+10F800..U+10FFFF character from the
+# placeholder it uses for a lone surrogate, so a conversation holding one is not read by either.
+EXPORT_FILE_LIMIT = 1 << 30
+EXPORT_DEPTH_LIMIT = 256
+EXPORT_UNSUPPORTED = 'not a UTF-8 JSON array of conversations nested at most 256 levels deep'
+# A literal character in that range, or a JSON escape whose surrogate pair decodes into it
+# (high surrogate \udbfe or \udbff).
+EXPORT_LOOKALIKE = re.compile('[\U0010F800-\U0010FFFF]|\\\\u[dD][bB][fF][eEfF]')
+JSON_NOT_STRUCTURE = bytes(range(256)).translate(None, b'"[]{}')
+JSON_PLAIN_STRING = re.compile(rb'"[^"]*"')
+JSON_EMPTY_PAIR = re.compile(rb'\[\]|\{\}')
+JSON_BRACKET = re.compile(rb'[\[\]{}]')
 
 def time_key(value):
     try:
@@ -106,7 +143,9 @@ def config_for(args):
 
 def initial_coverage(config):
     excluded = config.get('excluded', [])
-    for kind, line in (('claude', CLAUDE_EXCLUDED), ('antigravity', ANTIGRAVITY_EXCLUDED)):
+    for kind, line in (('claude', CLAUDE_EXCLUDED), ('antigravity', ANTIGRAVITY_EXCLUDED),
+                       ('chatgpt_export', EXPORT_EXCLUDED['chatgpt_export']),
+                       ('claude_export', EXPORT_EXCLUDED['claude_export'])):
         if isinstance(excluded, list) and any(s.get('kind') == kind for s in config.get('sources', [])):
             excluded = excluded + [line]
     return {'scope': 'configured sources only', 'complete': True, 'sources': [],
@@ -650,6 +689,424 @@ def antigravity_rows(root, resolved_root, source, status, coverage, seen_paths, 
                 problem(coverage, 'read_error', p, str(exc))
     return rows
 
+def epoch_iso(value):
+    """A ChatGPT export time, seconds since the Unix epoch as a JSON number, as ISO 8601 UTC text.
+    It is read from the number's shortest decimal form and cut, not rounded, to microseconds, so
+    both cores give the same text without float arithmetic. Other values, and whole parts of more
+    than 11 digits (after the year 5138), give None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    match = EPOCH_NUMBER.fullmatch(repr(value))
+    if not match:
+        return None
+    moment = datetime(1970, 1, 1) + timedelta(seconds=int(match[1]))
+    return '%04d-%02d-%02dT%02d:%02d:%02d.%sZ' % (moment.year, moment.month, moment.day, moment.hour,
+                                                   moment.minute, moment.second, (match[2] or '').ljust(6, '0')[:6])
+
+def nested_deeper(data, limit=EXPORT_DEPTH_LIMIT):
+    """Whether JSON text in `data` nests arrays and objects more than `limit` deep. Exact for valid
+    JSON: escaped backslashes and quotes go first, then everything but quotes and brackets, then
+    strings; each pass then removes the innermost pairs, one level a pass."""
+    text = data.replace(b'\\\\', b'').replace(b'\\"', b'').translate(None, JSON_NOT_STRUCTURE)
+    text = JSON_PLAIN_STRING.sub(b'', text)
+    for _ in range(limit):
+        text, removed = JSON_EMPTY_PAIR.subn(b'', text)
+        if not removed:
+            break
+    return JSON_BRACKET.search(text) is not None
+
+def export_spans(data):
+    """(start, length, value, lookalike) for each element of the top-level JSON array in `data`, one
+    at a time, with byte offsets into `data`; `lookalike` says the element's text holds a literal
+    U+10F800..U+10FFFF character. Raises ValueError or UnicodeError, possibly after some elements,
+    when `data` is not one UTF-8 JSON array nested at most EXPORT_DEPTH_LIMIT deep."""
+    bom = 3 if data.startswith(b'\xef\xbb\xbf') else 0
+    text = data[bom:].decode('utf-8')
+    if nested_deeper(data[bom:]):
+        raise ValueError('nested too deeply')
+    decoder = json.JSONDecoder()
+    cursor = [0, bom]
+    def at(index):
+        # Byte offset of a character index; indexes only move forward.
+        cursor[1] += len(text[cursor[0]:index].encode('utf-8'))
+        cursor[0] = index
+        return cursor[1]
+    i = JSON_SPACE.match(text).end()
+    if text[i:i + 1] != '[':
+        raise ValueError('not a JSON array')
+    i = JSON_SPACE.match(text, i + 1).end()
+    if text[i:i + 1] == ']':
+        i += 1
+    else:
+        while True:
+            value, end = decoder.raw_decode(text, i)
+            start = at(i)
+            yield start, at(end) - start, value, EXPORT_LOOKALIKE.search(text, i, end) is not None
+            i = JSON_SPACE.match(text, end).end()
+            if text[i:i + 1] == ',':
+                i = JSON_SPACE.match(text, i + 1).end()
+            elif text[i:i + 1] == ']':
+                i += 1
+                break
+            else:
+                raise ValueError('expected , or ]')
+    if JSON_SPACE.match(text, i).end() != len(text):
+        raise ValueError('extra data after the array')
+
+def export_conversation_fields(kind, value):
+    """(identity, title, created, updated) of one exported conversation object."""
+    if kind == 'chatgpt_export':
+        ident = value.get('conversation_id') or value.get('id')
+        title, created, updated = value.get('title'), epoch_iso(value.get('create_time')), epoch_iso(value.get('update_time'))
+    else:
+        ident, title, created, updated = value.get('uuid'), value.get('name'), value.get('created_at'), value.get('updated_at')
+        created = created if isinstance(created, str) else None
+        updated = updated if isinstance(updated, str) else None
+    return (ident if isinstance(ident, str) and ident else None,
+            title if isinstance(title, str) and title else None, created, updated)
+
+def export_rows(root, resolved_root, source, status, coverage, seen_paths, guard):
+    """Rows for a folder holding official data exports (ChatGPT or claude.ai) extracted from their
+    ZIP. Every conversations.json or conversations-NNN.json is a JSON array of conversations, and
+    each conversation is one row: `export_offset` and `bytes` give its span in that file, and its
+    guard, kept for every command, hashes the span. A ZIP is reported, not opened; a file over
+    EXPORT_FILE_LIMIT is reported, not read; a file that is not one array is reported whole, with
+    no rows. An identity seen earlier in the same file is reported, not listed twice. Each file's
+    newest update is a note: an export is a snapshot, and nothing after it is here."""
+    rows = []
+    def walk_error(exc):
+        status['status'] = 'partial'
+        problem(coverage, 'read_error', root, str(exc))
+    for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+        kept = []
+        for d in dirs:
+            p = Path(directory) / d
+            if p.is_symlink() or (hasattr(p, 'is_junction') and p.is_junction()):
+                problem(coverage, 'excluded_link', p)
+            else:
+                kept.append(d)
+        dirs[:] = sorted(kept)
+        for name in sorted(names):
+            p = Path(directory) / name
+            resolved = str(resolved_root / p.relative_to(root))
+            if name.lower().endswith('.zip'):
+                coverage['notes'].append({'kind': 'export_archive_not_searched', 'path': resolved,
+                                          'detail': 'extract the archive to search its conversations'})
+                continue
+            if not EXPORT_FILE.fullmatch(name):
+                continue
+            if p.is_symlink():
+                problem(coverage, 'excluded_link', p)
+                continue
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            status['files'] += 1
+            coverage['files'] += 1
+            try:
+                stat = p.stat()
+                if stat.st_size > EXPORT_FILE_LIMIT:
+                    problem(coverage, 'export_too_large', p, 'larger than 1 GiB; not read')
+                    continue
+                data = p.read_bytes()
+            except OSError as exc:
+                problem(coverage, 'read_error', p, str(exc))
+                continue
+            if len(data) != stat.st_size:
+                problem(coverage, 'changed_during_read', p)
+                continue
+            found, issues, identities, newest = [], [], set(), None
+            try:
+                for number, (start, length, value, lookalike) in enumerate(export_spans(data), 1):
+                    where = 'conversation ' + str(number)
+                    if lookalike:
+                        issues.append(('unsupported_record', where + ': a character in U+10F800..U+10FFFF', True))
+                        continue
+                    if not isinstance(value, dict):
+                        issues.append(('unsupported_record', where, True))
+                        continue
+                    ident, title, created, updated = export_conversation_fields(source['kind'], value)
+                    if ident is None:
+                        issues.append(('identity_unavailable', where, False))
+                        continue
+                    if ident.casefold() in identities:
+                        issues.append(('identity_duplicate', where, False))
+                        continue
+                    identities.add(ident.casefold())
+                    if updated and time_key(updated) > time_key(newest):
+                        newest = updated
+                    found.append({'id': ident, 'agent': source['kind'], 'source': source['name'], 'kind': 'conversation',
+                                  'parent_id': None, 'path': resolved, 'bytes': length, 'mtime_ns': stat.st_mtime_ns,
+                                  'timestamp': created, 'timestamp_basis': 'conversation created' if created else 'unknown',
+                                  'title': title, 'export_offset': start, 'export_conversation': number,
+                                  '_guards': [[start, length, hashlib.sha256(data[start:start + length]).hexdigest()]]})
+            except (ValueError, UnicodeError):
+                problem(coverage, 'export_unsupported', p, EXPORT_UNSUPPORTED)
+                continue
+            for kind, detail, counted in issues:
+                if counted:
+                    coverage['unsupported_records'] += 1
+                problem(coverage, kind, p, detail)
+            rows.extend(found)
+            coverage['notes'].append({'kind': 'export_snapshot', 'path': resolved,
+                                      'detail': 'a snapshot as exported; newest conversation update ' + (newest or 'unknown')})
+    return rows
+
+def export_block(path):
+    return json.dumps(list(path), ensure_ascii=False, separators=(',', ':'))
+
+def export_messages(kind, conversation):
+    """(message, on_current_branch) for each message of one exported conversation, in reading order.
+    ChatGPT keeps a conversation as a tree (`mapping`, with edits and regenerations as branches),
+    stored in no particular order: it is read depth-first from each root, children in stored order,
+    then any node left unreached, and `current_node` names the branch shown in the app. A claude.ai
+    export keeps a list and names no current branch, so the flag is None. Raises ValueError on an
+    unknown shape."""
+    if kind == 'claude_export':
+        messages = conversation.get('chat_messages')
+        if not isinstance(messages, list):
+            raise ValueError('chat_messages must be a list')
+        return [(message, None) for message in messages]
+    mapping = conversation.get('mapping')
+    if not isinstance(mapping, dict):
+        raise ValueError('mapping must be an object')
+    def parent_of(key):
+        node = mapping[key]
+        parent = node.get('parent') if isinstance(node, dict) else None
+        return parent if isinstance(parent, str) and parent in mapping else None
+    current = set()
+    key = conversation.get('current_node')
+    while isinstance(key, str) and key in mapping and key not in current:
+        current.add(key)
+        key = parent_of(key)
+    order, seen = [], set()
+    for start in [k for k in mapping if parent_of(k) is None] + list(mapping):
+        stack = [start]
+        while stack:
+            key = stack.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            order.append(key)
+            children = mapping[key].get('children') if isinstance(mapping[key], dict) else None
+            if isinstance(children, list):
+                stack.extend(reversed([c for c in children if isinstance(c, str) and c in mapping and c not in seen]))
+    messages = []
+    for key in order:
+        node = mapping[key]
+        if not isinstance(node, dict):
+            # Not a node at all (null included): passed on, to be counted as unsupported.
+            messages.append((node, key in current))
+        elif node.get('message') is not None:
+            messages.append((node['message'], key in current))
+    return messages
+
+def chatgpt_fields(message):
+    """(fields, unknown) of one ChatGPT export message. A user message the app hides (custom
+    instructions, context it adds) has the system role; an assistant message addressed to a tool is
+    a tool call. Reasoning (thoughts, reasoning_recap) is never searched. `unknown` names content
+    types and parts this reader does not know. Raises ValueError for an unknown author or content shape."""
+    author = message.get('author')
+    role = author.get('role') if isinstance(author, dict) else None
+    if role not in ('user', 'assistant', 'system', 'tool'):
+        raise ValueError('unknown author role')
+    content = message.get('content')
+    if not isinstance(content, dict):
+        raise ValueError('content must be an object')
+    kind = content.get('content_type')
+    metadata = message.get('metadata')
+    if role == 'user' and isinstance(metadata, dict) and metadata.get('is_visually_hidden_from_conversation') is True:
+        role = 'system'
+    if role == 'assistant' and message.get('recipient') not in (None, 'all'):
+        role = 'tool_input'
+    fields, unknown = [], []
+    if kind in ('text', 'multimodal_text'):
+        parts = content.get('parts')
+        if not isinstance(parts, list):
+            raise ValueError('parts must be a list')
+        for index, part in enumerate(parts):
+            part_kind = part.get('content_type') if isinstance(part, dict) else None
+            if isinstance(part, str):
+                if part:
+                    fields.append((role, part, export_block(('content', 'parts', index))))
+            elif part_kind == 'audio_transcription':
+                if isinstance(part.get('text'), str) and part['text']:
+                    fields.append((role, part['text'], export_block(('content', 'parts', index, 'text'))))
+            elif part_kind not in CHATGPT_MEDIA:
+                unknown.append('part ' + (part_kind if isinstance(part_kind, str) else '(none)'))
+        return fields, unknown
+    if kind in CHATGPT_SILENT:
+        return fields, []
+    if not isinstance(kind, str) or kind not in CHATGPT_FIELDS:
+        return fields, ['content type ' + (kind if isinstance(kind, str) else '(none)')]
+    if kind == 'user_editable_context':
+        role = 'system'
+    for name in CHATGPT_FIELDS[kind]:
+        value = content.get(name)
+        if isinstance(value, str) and value:
+            fields.append((role, value, export_block(('content', name))))
+    return fields, []
+
+def claude_export_fields(message):
+    """(fields, unknown) of one claude.ai export message: its content blocks, as Claude Code's are
+    read, and the text claude.ai extracted from attached files. Thinking is never searched. `unknown`
+    names block types, tool result items and attachments this reader does not know. Raises
+    ValueError for an unknown sender or shape."""
+    sender = message.get('sender')
+    role = {'human': 'user', 'assistant': 'assistant'}.get(sender) if isinstance(sender, str) else None
+    if role is None:
+        raise ValueError('unknown sender')
+    content = message.get('content')
+    if not isinstance(content, list):
+        raise ValueError('content must be a list')
+    fields, unknown = [], []
+    for index, block in enumerate(content):
+        kind = block.get('type') if isinstance(block, dict) else None
+        if kind in ('text', 'voice_note'):
+            if isinstance(block.get('text'), str) and block['text']:
+                fields.append((role, block['text'], index))
+        elif kind == 'tool_use':
+            fields.extend(('tool_input', text, field) for text, field in input_strings(block.get('input', {}), (index, 'input'))
+                          if text)
+        elif kind == 'tool_result':
+            value = block.get('content', '')
+            if isinstance(value, str):
+                if value:
+                    fields.append(('tool', value, index))
+            elif isinstance(value, list):
+                for sub_index, sub in enumerate(value):
+                    sub_kind = sub.get('type') if isinstance(sub, dict) else None
+                    if sub_kind not in CLAUDE_RESULT_ITEMS:
+                        unknown.append('tool result ' + (sub_kind if isinstance(sub_kind, str) else '(none)'))
+                    elif isinstance(sub.get('text'), str) and sub['text']:
+                        fields.append(('tool', sub['text'], str(index) + '.content[' + str(sub_index) + ']'))
+            elif value is not None:
+                unknown.append('tool result content')
+        elif kind not in CLAUDE_EXPORT_SILENT:
+            unknown.append('content type ' + (kind if isinstance(kind, str) else '(none)'))
+    attachments = message.get('attachments')
+    for index, item in enumerate(attachments if isinstance(attachments, list) else []):
+        if not isinstance(item, dict):
+            unknown.append('attachment')
+        elif isinstance(item.get('extracted_content'), str) and item['extracted_content']:
+            fields.append(('attachment', item['extracted_content'], export_block(('attachments', index, 'extracted_content'))))
+    return fields, unknown
+
+def export_span(row):
+    with Path(row['path']).open('rb') as f:
+        f.seek(row['export_offset'])
+        return f.read(row['bytes'])
+
+def export_message_fields(row, coverage, strong=True, report=True):
+    """(number, message, on_current_branch, fields) for each message of an exported conversation
+    that this reader can read, after checking its span against the inventory. A span that differs
+    from the one the inventory read is checked again for depth and lookalike characters. With
+    `report` false (listing), what this reader cannot read is skipped without being counted."""
+    p = Path(row['path'])
+    try:
+        data = export_span(row)
+    except OSError as exc:
+        if row.get('_prefix_sha256'):
+            coverage['snapshot_invalid'] = True
+        problem(coverage, 'read_error', p, str(exc))
+        return
+    digest = hashlib.sha256(data).hexdigest()
+    guards = row.get('_guards') or []
+    verified = bool(guards) and len(data) == row['bytes'] and all(
+        g == [row['export_offset'], row['bytes'], digest] for g in guards)
+    if len(data) != row['bytes'] or any(g != [row['export_offset'], row['bytes'], digest] for g in guards):
+        problem(coverage, 'changed_since_inventory', p)
+    expected = row.get('_prefix_sha256')
+    if expected and digest != expected:
+        coverage['snapshot_invalid'] = True
+        problem(coverage, 'snapshot_prefix_changed', p)
+    if strong or expected:
+        row['_prefix_sha256'] = digest
+    where = 'conversation ' + str(row['export_conversation'])
+    def unsupported(detail):
+        if report:
+            coverage['unsupported_records'] += 1
+            problem(coverage, 'unsupported_record', p, detail)
+    try:
+        text = data.decode('utf-8')
+        if not verified and (nested_deeper(data) or EXPORT_LOOKALIKE.search(text)):
+            raise ValueError('not readable as inventoried')
+        conversation = json.loads(text)
+        if not isinstance(conversation, dict):
+            raise ValueError('conversation must be an object')
+        messages = export_messages(row['agent'], conversation)
+    except (ValueError, UnicodeError):
+        unsupported(where)
+        return
+    reader = chatgpt_fields if row['agent'] == 'chatgpt_export' else claude_export_fields
+    id_key = 'id' if row['agent'] == 'chatgpt_export' else 'uuid'
+    identities = set()
+    for number, (message, current) in enumerate(messages, 1):
+        try:
+            if not isinstance(message, dict):
+                raise ValueError('message must be an object')
+            ident = message.get(id_key)
+            if isinstance(ident, str):
+                # A message id names one message; a second message with it is not read.
+                if ident in identities:
+                    unsupported(where + ' message ' + str(number) + ': duplicate message id')
+                    continue
+                identities.add(ident)
+            fields, unknown = reader(message)
+        except ValueError:
+            unsupported(where + ' message ' + str(number))
+            continue
+        for kind in unknown:
+            unsupported(where + ' message ' + str(number) + ': ' + kind)
+        yield number, message, current, fields
+
+def export_records(row, coverage, needle=None, strong=True):
+    """records() for one conversation of a data export. `line` numbers its messages in reading order
+    and `block` is the field within the message. An export is one JSON document, so a message has no
+    line of its own: `byte_offset` is None, and `record_sha256` hashes the message object as
+    json.dumps writes it (ASCII, default separators)."""
+    chatgpt = row['agent'] == 'chatgpt_export'
+    for number, message, current, fields in export_message_fields(row, coverage, strong):
+        if needle is not None:
+            fields = [(role, text, block) for role, text, block in fields if needle in text.casefold()]
+        if not fields:
+            continue
+        digest = hashlib.sha256(json.dumps(message).encode('utf-8')).hexdigest()
+        if chatgpt:
+            timestamp, record_id = epoch_iso(message.get('create_time')), message.get('id')
+        else:
+            timestamp, record_id = message.get('created_at'), message.get('uuid')
+            timestamp = timestamp if isinstance(timestamp, str) else None
+        record_id = record_id if isinstance(record_id, str) else None
+        for role, text, block in fields:
+            provenance, confidence = classify(row, role, text)
+            hit = {**row, 'line': number, 'byte_offset': None, 'block': block,
+                   'record_sha256': digest, 'record_id': record_id,
+                   'timestamp': timestamp, 'timestamp_basis': 'record' if timestamp else 'unknown',
+                   'role': 'assistant' if role == 'tool_input' else 'user' if role == 'attachment' else role,
+                   'record_session_id': None, 'provenance': provenance, 'content_provenance': provenance,
+                   'confidence': confidence, 'text': text, 'self': False}
+            if current is not None:
+                hit['current_branch'] = current
+            yield hit
+
+def export_list_row(row, coverage):
+    """list_row() for an exported conversation: the conversation's own span is read whole, and its
+    SHA-256 pins the span for a paging snapshot. Like a transcript's list read, it skips what it
+    cannot read without counting it; `find` and `read` count it."""
+    preview, last = None, None
+    chatgpt = row['agent'] == 'chatgpt_export'
+    for _, message, _, fields in export_message_fields(row, coverage, report=False):
+        stamp = epoch_iso(message.get('create_time')) if chatgpt else message.get('created_at')
+        stamp = stamp if isinstance(stamp, str) else None
+        if fields and time_key(stamp) > time_key(last):
+            last = stamp
+        if preview is None:
+            preview = next((text[:160] for role, text, _ in fields if role == 'user'), None)
+    return {**public_row(row), 'timestamp': last,
+            'timestamp_basis': 'latest message in the exported conversation' if last else 'unknown',
+            'preview': preview, 'title': row.get('title'), 'inspected_bytes': row['bytes']}
+
 def link_subagents(rows, coverage):
     """Mark Antigravity conversations that another conversation created. A subagent's USER_INPUT
     holds its creator's prompt, not the operator's. In the creating step's text, the first line after
@@ -697,8 +1154,9 @@ def inventory(config, coverage, guard=True):
             status['status'] = 'unavailable'
             problem(coverage, 'source_unavailable', root)
             continue
-        if source['kind'] in ('chatgpt_project', 'antigravity'):
-            reader = project_rows if source['kind'] == 'chatgpt_project' else antigravity_rows
+        if source['kind'] in ('chatgpt_project', 'antigravity') + EXPORT_KINDS:
+            reader = (project_rows if source['kind'] == 'chatgpt_project' else
+                      antigravity_rows if source['kind'] == 'antigravity' else export_rows)
             try:
                 rows.extend(reader(root, root.resolve(), source, status, coverage, seen_paths, guard))
             except OSError as exc:
@@ -961,9 +1419,13 @@ def classify(row, role, text):
         return 'tool_input', 'record_type'
     if role == 'metadata':
         return 'title_metadata', 'record_type'
-    if role == 'system' and row['agent'] in ('antigravity', 'claude'):
-        # Claude rows get this role only from a mid-turn message whose sender is not human.
+    if role == 'system' and row['agent'] in ('antigravity', 'claude') + EXPORT_KINDS:
+        # Claude rows get this role only from a mid-turn message whose sender is not human; export
+        # rows from system messages and from user messages the app hides.
         return 'injected_context', 'record_type'
+    if role == 'attachment':
+        # Text claude.ai extracted from a file attached to a message.
+        return 'quoted_or_pasted', 'record_type'
     lower = text.lstrip().casefold()
     if '<codex_delegation>' in lower or row['kind'] in ('subagent', 'reviewer') and role == 'user':
         return 'delegated_prompt', 'metadata_or_marker'
@@ -984,6 +1446,9 @@ def classify(row, role, text):
 def records(row, coverage, needle=None, strong=True):
     if row.get('format') in ('docx', 'xlsx'):
         yield from package_records(row, coverage, needle, strong)
+        return
+    if row['agent'] in EXPORT_KINDS:
+        yield from export_records(row, coverage, needle, strong)
         return
     text_mode = row['kind'] == 'document' or row.get('format') == 'text'
     p = Path(row['path'])
@@ -1259,19 +1724,36 @@ def search(rows, query, coverage, titles, max_matches=10000, jobs=1, strong=True
             provenance = hit['content_provenance']
         return ranks.get(provenance, 10)
     hits.sort(key=lambda h: (rank(h), time_key(h.get('timestamp')), h['id'], h['path'], h['line'], str(h['block'])))
-    # Collapse only byte-identical extracted text tied by the import registry.
+    # Collapse only byte-identical extracted text tied by the import registry, and the same message
+    # field of the same conversation in another export (a later or earlier snapshot of it).
     originals = {(h['id'], h['text']): h for h in hits if h['agent'] == 'claude' and not h.get('text_truncated')}
+    exported = {}
     kept = []
     for hit in hits:
         original = originals.get((hit.get('original_id'), hit['text'])) if not hit.get('text_truncated') else None
         if hit['provenance'] == 'import_copy' and original:
             original.setdefault('copies', []).append({k: hit[k] for k in ('id', 'path', 'line', 'record_sha256')})
-        else:
-            kept.append(hit)
+            continue
+        if hit['agent'] in EXPORT_KINDS and hit['provenance'] != 'title_metadata':
+            # The message's own id names it within its conversation; without one, its line does.
+            place = hit['record_id'] if hit['record_id'] is not None else hit['line']
+            key = (hit['agent'], hit['id'], json.dumps(place), hit['record_sha256'], json.dumps(hit['block']))
+            first = exported.get(key)
+            if first is not None and (first['path'], first.get('export_offset')) != (hit['path'], hit.get('export_offset')):
+                copy = {k: hit[k] for k in ('id', 'path', 'line', 'record_sha256')}
+                copy['export_offset'] = hit.get('export_offset')
+                if 'current_branch' in hit:
+                    copy['current_branch'] = hit['current_branch']
+                first.setdefault('copies', []).append(copy)
+                continue
+            exported.setdefault(key, hit)
+        kept.append(hit)
     return kept
 
 def list_row(row, coverage):
     """Bounded head/tail inspection; never claim full transcript validation."""
+    if row['agent'] in EXPORT_KINDS:
+        return export_list_row(row, coverage)
     window = 65536
     size = row['bytes']
     ranges = [(0, min(size, window))]
@@ -1433,12 +1915,45 @@ def verify_search_snapshot(rows):
         expected = row.get('_prefix_sha256')
         if expected:
             try:
-                if prefix_digest(row['path'], row['bytes']) != expected:
+                observed = (hashlib.sha256(export_span(row)).hexdigest() if row.get('agent') in EXPORT_KINDS
+                            else prefix_digest(row['path'], row['bytes']))
+                if observed != expected:
                     raise StaleCursor('captured source prefix changed: ' + row['path'])
             except OSError as exc:
                 raise StaleCursor('captured source unavailable: ' + row['path']) from exc
 
-def reopen_hit(hit, query, titles):
+def reopen_export(hit, query, captured, cache, wanted=None):
+    """reopen_hit() for a saved export match. Its conversation is read once per page, from the row
+    the snapshot captured, whose span digest the bytes must still match. Only the fields the page
+    shows (`wanted`, by span) are kept, each as its digest and its excerpt, not its whole text."""
+    key = (hit['path'], hit.get('export_offset'))
+    if key not in cache:
+        row = captured.get(key)
+        if row is None or not row.get('_prefix_sha256'):
+            raise StaleCursor('captured source unavailable: ' + hit['path'])
+        part = {'complete': True, 'errors': [], 'notes': [], 'malformed_records': 0,
+                'unfinished_records': 0, 'changed_files': 0, 'unsupported_records': 0}
+        found = {}
+        needed = None if wanted is None else wanted.get(key, set())
+        for record in export_records(dict(row), part):
+            place = (record['line'], json.dumps(record['block']))
+            if (needed is None or place in needed) and place not in found:
+                found[place] = (record['record_sha256'], excerpt({'text': record['text']}, query))
+        if part.get('snapshot_invalid') or any(e['kind'] in ('read_error', 'changed_since_inventory') for e in part['errors']):
+            raise StaleCursor('captured source prefix changed: ' + hit['path'])
+        cache[key] = found
+    kept = cache[key].get((hit['line'], json.dumps(hit['block'])))
+    if kept is None:
+        raise StaleCursor('matching content block unavailable')
+    digest, piece = kept
+    if digest != hit['record_sha256']:
+        raise StaleCursor('matching record changed: ' + hit['path'])
+    # The same fields, in the same order, as excerpt({**hit, 'text': <whole text>}, query).
+    out = public_row({**hit, 'text': piece['text']})
+    out['text_truncated'], out['text_start_character'] = piece['text_truncated'], piece['text_start_character']
+    return out
+
+def reopen_hit(hit, query, titles, captured=None, cache=None, wanted=None):
     if hit['provenance'] == 'title_metadata' and hit['id'] in titles and hit['path'] == titles[hit['id']]['path']:
         return {**hit, 'text': titles[hit['id']]['text']}
     if hit.get('format') in ('docx', 'xlsx'):
@@ -1449,6 +1964,8 @@ def reopen_hit(hit, query, titles):
         if not 1 <= hit['line'] <= len(units) or hashlib.sha256(units[hit['line'] - 1].encode('utf-8')).hexdigest() != hit['record_sha256']:
             raise StaleCursor('matching record changed: ' + hit['path'])
         return excerpt({**hit, 'text': units[hit['line'] - 1]}, query)
+    if hit.get('agent') in EXPORT_KINDS:
+        return reopen_export(hit, query, captured or {}, {} if cache is None else cache, wanted)
     with open_session(hit['path']) as stream:
         stream.seek(hit['byte_offset'])
         raw = stream.readline()
@@ -1597,9 +2114,10 @@ def main(argv=None):
             raise ValueError('source configuration must be an object with a sources array')
         for source in config['sources']:
             if (not isinstance(source, dict)
-                    or source.get('kind') not in ('claude', 'codex', 'antigravity', 'document', 'chatgpt_project')
+                    or source.get('kind') not in ('claude', 'codex', 'antigravity', 'document', 'chatgpt_project') + EXPORT_KINDS
                     or not isinstance(source.get('name'), str) or not isinstance(source.get('path'), str)):
-                raise ValueError('each source needs string name/path and kind claude, codex, antigravity, document, or chatgpt_project')
+                raise ValueError('each source needs string name/path and kind claude, codex, antigravity, document, '
+                                 'chatgpt_project, chatgpt_export, or claude_export')
         if args.source:
             names = {s['name'] for s in config.get('sources', [])}
             if set(args.source) - names:
@@ -1680,13 +2198,24 @@ def main(argv=None):
                 raise StaleCursor('captured source bytes changed or disappeared')
             if not paginate(hits, args, key, result):
                 return emit(args, result, 3)
+            captured = {(r['path'], r.get('export_offset')): r for r in rows if r.get('agent') in EXPORT_KINDS}
             if args.command == 'find' and saved and saved.get('matches') is not None:
-                result['results'] = [reopen_hit(hit, query, titles) for hit in result['results']]
+                wanted = {}
+                for hit in result['results']:
+                    if hit.get('agent') in EXPORT_KINDS:
+                        wanted.setdefault((hit['path'], hit.get('export_offset')), set()).add((hit['line'], json.dumps(hit['block'])))
+                cache = {}
+                result['results'] = [reopen_hit(hit, query, titles, captured, cache, wanted) for hit in result['results']]
             if args.command == 'find' and args.context:
                 for hit in result['results']:
                     if hit['provenance'] != 'title_metadata':
                         context_coverage = initial_coverage(config)
-                        hit['context'] = context_for(hit, hit['line'], args.context, context_coverage)
+                        target = hit
+                        if hit['agent'] in EXPORT_KINDS:
+                            # The context is read against the span guard the inventory captured.
+                            source = captured.get((hit['path'], hit.get('export_offset')))
+                            target = {**hit, '_guards': source['_guards'] if source else []}
+                        hit['context'] = context_for(target, hit['line'], args.context, context_coverage)
                         matching = [r for r in hit['context'] if r['line'] == hit['line']]
                         if not matching or matching[0]['record_sha256'] != hit['record_sha256']:
                             problem(coverage, 'context_record_changed', hit['path'])
